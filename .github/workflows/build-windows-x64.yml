@@ -1,4 +1,4 @@
-name: Rust-build-windows-x64
+name: build-windows-x64
 
 on:
   push:
