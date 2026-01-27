@@ -13,12 +13,14 @@ use unicode_width::UnicodeWidthStr;
 use super::{
     cursor::Cursor,
     engines::{SearchEngine, SearchState},
-    history_list::{HistoryList, ListState, PREFIX_LENGTH},
+    history_list::{HistoryList, ListState},
 };
 use atuin_client::{
     database::{Database, current_context},
     history::{History, HistoryId, HistoryStats, store::HistoryStore},
-    settings::{CursorStyle, ExitMode, KeymapMode, PreviewStrategy, SearchMode, Settings},
+    settings::{
+        CursorStyle, ExitMode, KeymapMode, PreviewStrategy, SearchMode, Settings, UiColumn,
+    },
 };
 
 use crate::command::client::search::history_list::HistoryHighlighter;
@@ -27,7 +29,7 @@ use crate::{VERSION, command::client::search::engines};
 
 use ratatui::{
     Frame, Terminal, TerminalOptions, Viewport,
-    backend::CrosstermBackend,
+    backend::{CrosstermBackend, FromCrossterm},
     crossterm::{
         cursor::SetCursorStyle,
         event::{
@@ -40,7 +42,7 @@ use ratatui::{
     prelude::*,
     style::{Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Padding, Paragraph, Tabs, block::Title},
+    widgets::{Block, BorderType, Borders, Padding, Paragraph, Tabs},
 };
 
 #[cfg(not(target_os = "windows"))]
@@ -117,6 +119,7 @@ pub struct State {
     prefix: bool,
     current_cursor: Option<CursorStyle>,
     tab_index: usize,
+    pending_vim_key: Option<char>,
 
     pub inspecting_state: InspectingState,
 
@@ -304,6 +307,9 @@ impl State {
             {
                 Some(InputAction::Accept(self.results_state.selected()))
             }
+            KeyCode::Left | KeyCode::Backspace if self.search.input.as_str().is_empty() => {
+                Some(InputAction::Accept(self.results_state.selected()))
+            }
             KeyCode::Char('o') if ctrl => {
                 self.tab_index = (self.tab_index + 1) % TAB_TITLES.len();
                 Some(InputAction::Continue)
@@ -396,60 +402,175 @@ impl State {
 
         // handle keymap specific keybindings.
         match self.keymap_mode {
-            KeymapMode::VimNormal => match input.code {
-                KeyCode::Char('?' | '/') if !ctrl => {
-                    self.search.input.clear();
-                    self.set_keymap_cursor(settings, "vim_insert");
-                    self.keymap_mode = KeymapMode::VimInsert;
-                    return InputAction::Continue;
+            KeymapMode::VimNormal => {
+                // Reset pending key unless this is 'g' (for gg sequence)
+                if !matches!(input.code, KeyCode::Char('g')) || ctrl {
+                    self.pending_vim_key = None;
                 }
-                KeyCode::Char('j') if !ctrl => {
-                    return self.handle_search_down(settings, true);
+
+                match input.code {
+                    KeyCode::Char('?' | '/') if !ctrl => {
+                        self.search.input.clear();
+                        self.set_keymap_cursor(settings, "vim_insert");
+                        self.keymap_mode = KeymapMode::VimInsert;
+                        return InputAction::Continue;
+                    }
+                    KeyCode::Char('j') if !ctrl => {
+                        return self.handle_search_down(settings, true);
+                    }
+                    KeyCode::Char('k') if !ctrl => {
+                        return self.handle_search_up(settings, true);
+                    }
+                    KeyCode::Char('h') if !ctrl => {
+                        self.search.input.left();
+                        return InputAction::Continue;
+                    }
+                    KeyCode::Char('l') if !ctrl => {
+                        self.search.input.right();
+                        return InputAction::Continue;
+                    }
+                    KeyCode::Char('a') if !ctrl => {
+                        self.search.input.right();
+                        self.set_keymap_cursor(settings, "vim_insert");
+                        self.keymap_mode = KeymapMode::VimInsert;
+                        return InputAction::Continue;
+                    }
+                    KeyCode::Char('A') if !ctrl => {
+                        self.search.input.end();
+                        self.set_keymap_cursor(settings, "vim_insert");
+                        self.keymap_mode = KeymapMode::VimInsert;
+                        return InputAction::Continue;
+                    }
+                    KeyCode::Char('i') if !ctrl => {
+                        self.set_keymap_cursor(settings, "vim_insert");
+                        self.keymap_mode = KeymapMode::VimInsert;
+                        return InputAction::Continue;
+                    }
+                    KeyCode::Char('I') if !ctrl => {
+                        self.search.input.start();
+                        self.set_keymap_cursor(settings, "vim_insert");
+                        self.keymap_mode = KeymapMode::VimInsert;
+                        return InputAction::Continue;
+                    }
+                    KeyCode::Char(c @ '1'..='9') => {
+                        return c.to_digit(10).map_or(InputAction::Continue, |c| {
+                            InputAction::Accept(self.results_state.selected() + c as usize)
+                        });
+                    }
+                    KeyCode::Char('u') if ctrl => {
+                        // Half-page up (toward visual top)
+                        let scroll_len = self
+                            .results_state
+                            .max_entries()
+                            .saturating_sub(settings.scroll_context_lines)
+                            / 2;
+                        if settings.invert {
+                            self.scroll_down(scroll_len);
+                        } else {
+                            self.scroll_up(scroll_len);
+                        }
+                        return InputAction::Continue;
+                    }
+                    KeyCode::Char('d') if ctrl => {
+                        // Half-page down (toward visual bottom)
+                        let scroll_len = self
+                            .results_state
+                            .max_entries()
+                            .saturating_sub(settings.scroll_context_lines)
+                            / 2;
+                        if settings.invert {
+                            self.scroll_up(scroll_len);
+                        } else {
+                            self.scroll_down(scroll_len);
+                        }
+                        return InputAction::Continue;
+                    }
+                    KeyCode::Char('b') if ctrl => {
+                        // Full-page up (toward visual top)
+                        let scroll_len = self
+                            .results_state
+                            .max_entries()
+                            .saturating_sub(settings.scroll_context_lines);
+                        if settings.invert {
+                            self.scroll_down(scroll_len);
+                        } else {
+                            self.scroll_up(scroll_len);
+                        }
+                        return InputAction::Continue;
+                    }
+                    KeyCode::Char('f') if ctrl => {
+                        // Full-page down (toward visual bottom)
+                        let scroll_len = self
+                            .results_state
+                            .max_entries()
+                            .saturating_sub(settings.scroll_context_lines);
+                        if settings.invert {
+                            self.scroll_up(scroll_len);
+                        } else {
+                            self.scroll_down(scroll_len);
+                        }
+                        return InputAction::Continue;
+                    }
+                    KeyCode::Char('G') if !ctrl => {
+                        // Jump to visual bottom of history
+                        if settings.invert {
+                            let last_idx = self.results_len.saturating_sub(1);
+                            self.results_state.select(last_idx);
+                        } else {
+                            self.results_state.select(0);
+                        }
+                        self.inspecting_state.reset();
+                        return InputAction::Continue;
+                    }
+                    KeyCode::Char('g') if !ctrl => {
+                        if self.pending_vim_key == Some('g') {
+                            // gg - jump to visual top of history
+                            if settings.invert {
+                                self.results_state.select(0);
+                            } else {
+                                let last_idx = self.results_len.saturating_sub(1);
+                                self.results_state.select(last_idx);
+                            }
+                            self.inspecting_state.reset();
+                            self.pending_vim_key = None;
+                        } else {
+                            self.pending_vim_key = Some('g');
+                        }
+                        return InputAction::Continue;
+                    }
+                    KeyCode::Char('H') if !ctrl => {
+                        // Jump to top of visible screen
+                        let top = self.results_state.offset();
+                        let visible = self.results_state.max_entries().min(self.results_len);
+                        let bottom = top + visible.saturating_sub(1);
+                        self.results_state
+                            .select(bottom.min(self.results_len.saturating_sub(1)));
+                        self.inspecting_state.reset();
+                        return InputAction::Continue;
+                    }
+                    KeyCode::Char('M') if !ctrl => {
+                        // Jump to middle of visible screen
+                        let top = self.results_state.offset();
+                        let visible = self.results_state.max_entries().min(self.results_len);
+                        let middle = top + visible / 2;
+                        self.results_state
+                            .select(middle.min(self.results_len.saturating_sub(1)));
+                        self.inspecting_state.reset();
+                        return InputAction::Continue;
+                    }
+                    KeyCode::Char('L') if !ctrl => {
+                        // Jump to bottom of visible screen
+                        let top_visible = self.results_state.offset();
+                        self.results_state.select(top_visible);
+                        self.inspecting_state.reset();
+                        return InputAction::Continue;
+                    }
+                    KeyCode::Char(_) if !ctrl => {
+                        return InputAction::Continue;
+                    }
+                    _ => {}
                 }
-                KeyCode::Char('k') if !ctrl => {
-                    return self.handle_search_up(settings, true);
-                }
-                KeyCode::Char('h') if !ctrl => {
-                    self.search.input.left();
-                    return InputAction::Continue;
-                }
-                KeyCode::Char('l') if !ctrl => {
-                    self.search.input.right();
-                    return InputAction::Continue;
-                }
-                KeyCode::Char('a') if !ctrl => {
-                    self.search.input.right();
-                    self.set_keymap_cursor(settings, "vim_insert");
-                    self.keymap_mode = KeymapMode::VimInsert;
-                    return InputAction::Continue;
-                }
-                KeyCode::Char('A') if !ctrl => {
-                    self.search.input.end();
-                    self.set_keymap_cursor(settings, "vim_insert");
-                    self.keymap_mode = KeymapMode::VimInsert;
-                    return InputAction::Continue;
-                }
-                KeyCode::Char('i') if !ctrl => {
-                    self.set_keymap_cursor(settings, "vim_insert");
-                    self.keymap_mode = KeymapMode::VimInsert;
-                    return InputAction::Continue;
-                }
-                KeyCode::Char('I') if !ctrl => {
-                    self.search.input.start();
-                    self.set_keymap_cursor(settings, "vim_insert");
-                    self.keymap_mode = KeymapMode::VimInsert;
-                    return InputAction::Continue;
-                }
-                KeyCode::Char(c @ '1'..='9') => {
-                    return c.to_digit(10).map_or(InputAction::Continue, |c| {
-                        InputAction::Accept(self.results_state.selected() + c as usize)
-                    });
-                }
-                KeyCode::Char(_) if !ctrl => {
-                    return InputAction::Continue;
-                }
-                _ => {}
-            },
+            }
             KeymapMode::VimInsert => {
                 if input.code == KeyCode::Esc || (ctrl && input.code == KeyCode::Char('[')) {
                     self.set_keymap_cursor(settings, "vim_normal");
@@ -762,7 +883,7 @@ impl State {
                 .block(Block::default().borders(Borders::NONE))
                 .select(self.tab_index)
                 .style(Style::default())
-                .highlight_style(theme.as_style(Meaning::Important));
+                .highlight_style(Style::from_crossterm(theme.as_style(Meaning::Important)));
 
             f.render_widget(tabs, tabs_chunk);
         }
@@ -823,6 +944,7 @@ impl State {
                     theme,
                     history_highlighter,
                     settings.show_numeric_shortcuts,
+                    &settings.ui.columns,
                 );
                 f.render_stateful_widget(results_list, results_list_chunk, &mut self.results_state);
             }
@@ -832,7 +954,7 @@ impl State {
                     let message = Paragraph::new("Nothing to inspect")
                         .block(
                             Block::new()
-                                .title(Title::from(" Info ".to_string()))
+                                .title(Line::from(" Info ".to_string()))
                                 .title_alignment(Alignment::Center)
                                 .borders(Borders::ALL)
                                 .padding(Padding::vertical(2)),
@@ -882,11 +1004,30 @@ impl State {
                 preview_chunk.width.into(),
                 theme,
             );
-            self.draw_preview(f, style, input_chunk, compactness, preview_chunk, preview);
+            #[allow(clippy::cast_possible_truncation)]
+            let prefix_width = settings
+                .ui
+                .columns
+                .iter()
+                .take_while(|col| !col.expand)
+                .map(|col| col.width + 1)
+                .sum::<u16>()
+                + " > ".len() as u16;
+            #[allow(clippy::cast_possible_truncation)]
+            let min_prefix_width = "[ SRCH: FULLTXT ] ".len() as u16;
+            self.draw_preview(
+                f,
+                style,
+                input_chunk,
+                compactness,
+                preview_chunk,
+                preview,
+                std::cmp::max(prefix_width, min_prefix_width),
+            );
         }
     }
 
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_arguments)]
     fn draw_preview(
         &self,
         f: &mut Frame,
@@ -895,8 +1036,9 @@ impl State {
         compactness: Compactness,
         preview_chunk: Rect,
         preview: Paragraph,
+        prefix_width: u16,
     ) {
-        let input = self.build_input(style);
+        let input = self.build_input(style, prefix_width);
         f.render_widget(input, input_chunk);
 
         f.render_widget(preview, preview_chunk);
@@ -909,20 +1051,20 @@ impl State {
         };
         f.set_cursor_position((
             // Put cursor past the end of the input text
-            input_chunk.x + extra_width as u16 + PREFIX_LENGTH + 1 + cursor_offset,
+            input_chunk.x + extra_width as u16 + prefix_width + cursor_offset,
             input_chunk.y + cursor_offset,
         ));
     }
 
     fn build_title(&self, theme: &Theme) -> Paragraph<'_> {
         let title = if self.update_needed.is_some() {
-            let error_style: Style = theme.get_error().into();
+            let error_style: Style = Style::from_crossterm(theme.get_error());
             Paragraph::new(Text::from(Span::styled(
                 format!("Atuin v{VERSION} - UPDATE"),
                 error_style.add_modifier(Modifier::BOLD),
             )))
         } else {
-            let style: Style = theme.as_style(Meaning::Base).into();
+            let style: Style = Style::from_crossterm(theme.as_style(Meaning::Base));
             Paragraph::new(Text::from(Span::styled(
                 format!("Atuin v{VERSION}"),
                 style.add_modifier(Modifier::BOLD),
@@ -966,7 +1108,7 @@ impl State {
 
             _ => unreachable!("invalid tab index"),
         }
-        .style(theme.as_style(Meaning::Annotation))
+        .style(Style::from_crossterm(theme.as_style(Meaning::Annotation)))
         .alignment(Alignment::Center)
     }
 
@@ -975,7 +1117,7 @@ impl State {
             "history count: {}",
             self.history_count,
         ))))
-        .style(theme.as_style(Meaning::Annotation))
+        .style(Style::from_crossterm(theme.as_style(Meaning::Annotation)))
         .alignment(Alignment::Right)
     }
 
@@ -989,6 +1131,7 @@ impl State {
         theme: &'a Theme,
         history_highlighter: HistoryHighlighter<'a>,
         show_numeric_shortcuts: bool,
+        columns: &'a [UiColumn],
     ) -> HistoryList<'a> {
         let results_list = HistoryList::new(
             results,
@@ -999,6 +1142,7 @@ impl State {
             theme,
             history_highlighter,
             show_numeric_shortcuts,
+            columns,
         );
 
         match style.compactness {
@@ -1022,15 +1166,14 @@ impl State {
         }
     }
 
-    fn build_input(&self, style: StyleState) -> Paragraph<'_> {
-        /// Max width of the UI box showing current mode
-        const MAX_WIDTH: usize = 14;
+    fn build_input(&self, style: StyleState, prefix_width: u16) -> Paragraph<'_> {
         let (pref, mode) = if self.switched_search_mode {
             (" SRCH:", self.search_mode.as_str())
         } else {
             ("", self.search.filter_mode.as_str())
         };
-        let mode_width = MAX_WIDTH - pref.len();
+        // 3: surrounding "[" "] "
+        let mode_width = usize::from(prefix_width) - pref.len() - 3;
         // sanity check to ensure we don't exceed the layout limits
         debug_assert!(mode_width >= mode.len(), "mode name '{mode}' is too long!");
         let input = format!("[{pref}{mode:^mode_width$}] {}", self.search.input.as_str(),);
@@ -1089,7 +1232,8 @@ impl State {
                     .border_type(BorderType::Rounded)
                     .title(format!("{:─>width$}", "", width = chunk_width - 2)),
             ),
-            _ => Paragraph::new(command).style(theme.as_style(Meaning::Annotation)),
+            _ => Paragraph::new(command)
+                .style(Style::from_crossterm(theme.as_style(Meaning::Annotation))),
         }
     }
 }
@@ -1276,6 +1420,7 @@ pub async fn history(
             Box::new(OffsetDateTime::now_utc)
         },
         prefix: false,
+        pending_vim_key: None,
     };
 
     app.initialize_keymap_cursor(settings);
@@ -1664,6 +1809,7 @@ mod tests {
             prefix: false,
             current_cursor: None,
             tab_index: 0,
+            pending_vim_key: None,
             inspecting_state: InspectingState {
                 current: None,
                 next: None,
@@ -1715,6 +1861,7 @@ mod tests {
             prefix: false,
             current_cursor: None,
             tab_index: 0,
+            pending_vim_key: None,
             inspecting_state: InspectingState {
                 current: None,
                 next: None,
@@ -1742,42 +1889,62 @@ mod tests {
             "Tab should always accept"
         );
 
-        // Test left arrow with accept_past_line_start disabled (should continue)
+        // Test left arrow with empty search should accept (new default behavior)
+        let left_event = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
+        let result = state.handle_key_input(&settings, &left_event);
+        assert!(
+            matches!(result, super::InputAction::Accept(_)),
+            "Left arrow should accept when search is empty"
+        );
+
+        // Test backspace with empty search should accept (new default behavior)
+        let backspace_event = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        let result = state.handle_key_input(&settings, &backspace_event);
+        assert!(
+            matches!(result, super::InputAction::Accept(_)),
+            "Backspace should accept when search is empty"
+        );
+
+        // Test left/backspace with non-empty search at cursor start should NOT accept
+        state.search.input.insert('t');
+        state.search.input.insert('e');
+        state.search.input.insert('s');
+        state.search.input.insert('t');
+        state.search.input.start(); // Move cursor to start of non-empty search
+
         let left_event = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
         let result = state.handle_key_input(&settings, &left_event);
         assert!(
             matches!(result, super::InputAction::Continue),
-            "Left arrow should continue when disabled"
+            "Left arrow should continue when search is not empty (even at cursor start)"
         );
-
-        // Test left arrow with accept_past_line_start enabled (should accept at start of line)
-        settings.keys.accept_past_line_start = true;
-        let result = state.handle_key_input(&settings, &left_event);
-        assert!(
-            matches!(result, super::InputAction::Accept(_)),
-            "Left arrow should accept at start of line when enabled"
-        );
-        settings.keys.accept_past_line_start = false;
 
         let backspace_event = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
         let result = state.handle_key_input(&settings, &backspace_event);
         assert!(
             matches!(result, super::InputAction::Continue),
-            "Backspace should continue when disabled"
+            "Backspace should continue when search is not empty (even at cursor start)"
         );
 
+        // Test that accept_past_line_start flag still works with non-empty search at start
+        settings.keys.accept_past_line_start = true;
+        let result = state.handle_key_input(&settings, &left_event);
+        assert!(
+            matches!(result, super::InputAction::Accept(_)),
+            "Left arrow should accept at cursor start when flag enabled (even with non-empty search)"
+        );
+        settings.keys.accept_past_line_start = false;
+
+        // Test that accept_with_backspace flag still works with non-empty search at start
         settings.keys.accept_with_backspace = true;
         let result = state.handle_key_input(&settings, &backspace_event);
         assert!(
             matches!(result, super::InputAction::Accept(_)),
-            "Backspace should accept at start of line when enabled"
+            "Backspace should accept at cursor start when flag enabled (even with non-empty search)"
         );
+        settings.keys.accept_with_backspace = false;
 
-        state.search.input.insert('t');
-        state.search.input.insert('e');
-        state.search.input.insert('s');
-        state.search.input.insert('t');
-        state.search.input.end();
+        state.search.input.end(); // Move cursor back to end for remaining tests
 
         let right_event = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
         let result = state.handle_key_input(&settings, &right_event);
@@ -1803,5 +1970,275 @@ mod tests {
             "Backspace should continue at end of line, even when enabled"
         );
         settings.keys.accept_with_backspace = false;
+    }
+
+    #[test]
+    fn test_vim_gg_multikey_sequence() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let settings = Settings::utc();
+
+        let mut state = State {
+            history_count: 100,
+            update_needed: None,
+            results_state: ListState::default(),
+            switched_search_mode: false,
+            search_mode: SearchMode::Fuzzy,
+            results_len: 100,
+            accept: false,
+            keymap_mode: KeymapMode::VimNormal,
+            prefix: false,
+            current_cursor: None,
+            tab_index: 0,
+            pending_vim_key: None,
+            inspecting_state: InspectingState {
+                current: None,
+                next: None,
+                previous: None,
+            },
+            search: SearchState {
+                input: String::new().into(),
+                filter_mode: FilterMode::Global,
+                context: Context {
+                    session: String::new(),
+                    cwd: String::new(),
+                    hostname: String::new(),
+                    host_id: String::new(),
+                    git_root: None,
+                },
+            },
+            engine: engines::engine(SearchMode::Fuzzy),
+            now: Box::new(OffsetDateTime::now_utc),
+        };
+
+        // Start in the middle of the list
+        state.results_state.select(50);
+
+        // First 'g' should set pending state
+        let g_event = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE);
+        let result = state.handle_key_input(&settings, &g_event);
+        assert!(matches!(result, super::InputAction::Continue));
+        assert_eq!(state.pending_vim_key, Some('g'));
+        assert_eq!(state.results_state.selected(), 50); // Position unchanged
+
+        // Second 'g' should jump to end (visual top in non-inverted mode)
+        let result = state.handle_key_input(&settings, &g_event);
+        assert!(matches!(result, super::InputAction::Continue));
+        assert_eq!(state.pending_vim_key, None);
+        assert_eq!(state.results_state.selected(), 99); // Jumped to last index (visual top)
+    }
+
+    #[test]
+    fn test_vim_g_key_clears_on_other_input() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let settings = Settings::utc();
+
+        let mut state = State {
+            history_count: 100,
+            update_needed: None,
+            results_state: ListState::default(),
+            switched_search_mode: false,
+            search_mode: SearchMode::Fuzzy,
+            results_len: 100,
+            accept: false,
+            keymap_mode: KeymapMode::VimNormal,
+            prefix: false,
+            current_cursor: None,
+            tab_index: 0,
+            pending_vim_key: None,
+            inspecting_state: InspectingState {
+                current: None,
+                next: None,
+                previous: None,
+            },
+            search: SearchState {
+                input: String::new().into(),
+                filter_mode: FilterMode::Global,
+                context: Context {
+                    session: String::new(),
+                    cwd: String::new(),
+                    hostname: String::new(),
+                    host_id: String::new(),
+                    git_root: None,
+                },
+            },
+            engine: engines::engine(SearchMode::Fuzzy),
+            now: Box::new(OffsetDateTime::now_utc),
+        };
+
+        state.results_state.select(50);
+
+        // Press 'g' to set pending state
+        let g_event = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE);
+        state.handle_key_input(&settings, &g_event);
+        assert_eq!(state.pending_vim_key, Some('g'));
+
+        // Press 'j' - should clear pending state
+        let j_event = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+        state.handle_key_input(&settings, &j_event);
+        assert_eq!(state.pending_vim_key, None);
+    }
+
+    #[test]
+    fn test_vim_big_g_jump_to_bottom() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let settings = Settings::utc();
+
+        let mut state = State {
+            history_count: 100,
+            update_needed: None,
+            results_state: ListState::default(),
+            switched_search_mode: false,
+            search_mode: SearchMode::Fuzzy,
+            results_len: 100,
+            accept: false,
+            keymap_mode: KeymapMode::VimNormal,
+            prefix: false,
+            current_cursor: None,
+            tab_index: 0,
+            pending_vim_key: None,
+            inspecting_state: InspectingState {
+                current: None,
+                next: None,
+                previous: None,
+            },
+            search: SearchState {
+                input: String::new().into(),
+                filter_mode: FilterMode::Global,
+                context: Context {
+                    session: String::new(),
+                    cwd: String::new(),
+                    hostname: String::new(),
+                    host_id: String::new(),
+                    git_root: None,
+                },
+            },
+            engine: engines::engine(SearchMode::Fuzzy),
+            now: Box::new(OffsetDateTime::now_utc),
+        };
+
+        state.results_state.select(50);
+
+        // 'G' should jump to visual bottom (index 0 in non-inverted mode)
+        let big_g_event = KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE);
+        let result = state.handle_key_input(&settings, &big_g_event);
+        assert!(matches!(result, super::InputAction::Continue));
+        assert_eq!(state.results_state.selected(), 0);
+    }
+
+    #[test]
+    fn test_vim_ctrl_u_d_half_page_scroll() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let settings = Settings::utc();
+
+        let mut state = State {
+            history_count: 100,
+            update_needed: None,
+            results_state: ListState::default(),
+            switched_search_mode: false,
+            search_mode: SearchMode::Fuzzy,
+            results_len: 100,
+            accept: false,
+            keymap_mode: KeymapMode::VimNormal,
+            prefix: false,
+            current_cursor: None,
+            tab_index: 0,
+            pending_vim_key: None,
+            inspecting_state: InspectingState {
+                current: None,
+                next: None,
+                previous: None,
+            },
+            search: SearchState {
+                input: String::new().into(),
+                filter_mode: FilterMode::Global,
+                context: Context {
+                    session: String::new(),
+                    cwd: String::new(),
+                    hostname: String::new(),
+                    host_id: String::new(),
+                    git_root: None,
+                },
+            },
+            engine: engines::engine(SearchMode::Fuzzy),
+            now: Box::new(OffsetDateTime::now_utc),
+        };
+
+        state.results_state.select(50);
+
+        // Ctrl+d should return Continue and clear pending key
+        // (scroll amount depends on max_entries which is 0 in tests)
+        state.pending_vim_key = Some('g');
+        let ctrl_d_event = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        let result = state.handle_key_input(&settings, &ctrl_d_event);
+        assert!(matches!(result, super::InputAction::Continue));
+        assert_eq!(state.pending_vim_key, None);
+
+        // Ctrl+u should return Continue and clear pending key
+        state.pending_vim_key = Some('g');
+        let ctrl_u_event = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        let result = state.handle_key_input(&settings, &ctrl_u_event);
+        assert!(matches!(result, super::InputAction::Continue));
+        assert_eq!(state.pending_vim_key, None);
+    }
+
+    #[test]
+    fn test_vim_ctrl_f_b_full_page_scroll() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let settings = Settings::utc();
+
+        let mut state = State {
+            history_count: 100,
+            update_needed: None,
+            results_state: ListState::default(),
+            switched_search_mode: false,
+            search_mode: SearchMode::Fuzzy,
+            results_len: 100,
+            accept: false,
+            keymap_mode: KeymapMode::VimNormal,
+            prefix: false,
+            current_cursor: None,
+            tab_index: 0,
+            pending_vim_key: None,
+            inspecting_state: InspectingState {
+                current: None,
+                next: None,
+                previous: None,
+            },
+            search: SearchState {
+                input: String::new().into(),
+                filter_mode: FilterMode::Global,
+                context: Context {
+                    session: String::new(),
+                    cwd: String::new(),
+                    hostname: String::new(),
+                    host_id: String::new(),
+                    git_root: None,
+                },
+            },
+            engine: engines::engine(SearchMode::Fuzzy),
+            now: Box::new(OffsetDateTime::now_utc),
+        };
+
+        state.results_state.select(50);
+
+        // Ctrl+f should return Continue and clear pending key
+        // (scroll amount depends on max_entries which is 0 in tests)
+        state.pending_vim_key = Some('g');
+        let ctrl_f_event = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        let result = state.handle_key_input(&settings, &ctrl_f_event);
+        assert!(matches!(result, super::InputAction::Continue));
+        assert_eq!(state.pending_vim_key, None);
+
+        // Ctrl+b should return Continue and clear pending key
+        state.pending_vim_key = Some('g');
+        let ctrl_b_event = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        let result = state.handle_key_input(&settings, &ctrl_b_event);
+        assert!(matches!(result, super::InputAction::Continue));
+        assert_eq!(state.pending_vim_key, None);
     }
 }

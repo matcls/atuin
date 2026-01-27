@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap, convert::TryFrom, fmt, io::prelude::*, path::PathBuf, str::FromStr,
+    sync::OnceLock,
 };
 
 use atuin_common::record::HostId;
@@ -28,6 +29,8 @@ pub const LAST_VERSION_CHECK_FILENAME: &str = "last_version_check_time";
 pub const LATEST_VERSION_FILENAME: &str = "latest_version";
 pub const HOST_ID_FILENAME: &str = "host_id";
 static EXAMPLE_CONFIG: &str = include_str!("../config.toml");
+
+static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 mod dotfiles;
 mod kv;
@@ -451,8 +454,187 @@ pub enum PreviewStrategy {
     Fixed,
 }
 
+/// Column types available for the interactive search UI.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UiColumnType {
+    /// Command execution duration (e.g., "123ms")
+    Duration,
+    /// Relative time since execution (e.g., "59s ago")
+    Time,
+    /// Absolute timestamp (e.g., "2025-01-22 14:35")
+    Datetime,
+    /// Working directory
+    Directory,
+    /// Hostname
+    Host,
+    /// Username
+    User,
+    /// Exit code
+    Exit,
+    /// The command itself (should be last, expands to fill)
+    Command,
+}
+
+impl UiColumnType {
+    /// Returns the default width for this column type (in characters).
+    /// The Command column returns 0 as it expands to fill remaining space.
+    pub fn default_width(&self) -> u16 {
+        match self {
+            UiColumnType::Duration => 5,  // "814ms"
+            UiColumnType::Time => 9,      // "459ms ago"
+            UiColumnType::Datetime => 16, // "2025-01-22 14:35"
+            UiColumnType::Directory => 20,
+            UiColumnType::Host => 15,
+            UiColumnType::User => 10,
+            UiColumnType::Exit => 3,
+            UiColumnType::Command => 0, // Expands to fill
+        }
+    }
+}
+
+/// A column configuration with type and optional custom width.
+/// Can be specified as just a string (uses default width) or as an object with type and width.
+#[derive(Clone, Debug, Serialize)]
+pub struct UiColumn {
+    pub column_type: UiColumnType,
+    pub width: u16,
+    /// If true, this column expands to fill remaining space. Only one column should expand.
+    pub expand: bool,
+}
+
+impl UiColumn {
+    pub fn new(column_type: UiColumnType) -> Self {
+        Self {
+            width: column_type.default_width(),
+            expand: column_type == UiColumnType::Command,
+            column_type,
+        }
+    }
+
+    pub fn with_width(column_type: UiColumnType, width: u16) -> Self {
+        Self {
+            column_type,
+            width,
+            expand: column_type == UiColumnType::Command,
+        }
+    }
+}
+
+// Custom deserialize to handle both string and object formats:
+// "duration" or { type = "duration", width = 8, expand = true }
+impl<'de> serde::Deserialize<'de> for UiColumn {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, MapAccess, Visitor};
+
+        struct UiColumnVisitor;
+
+        impl<'de> Visitor<'de> for UiColumnVisitor {
+            type Value = UiColumn;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str(
+                    "a column type string or an object with 'type' and optional 'width'/'expand'",
+                )
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<UiColumn, E>
+            where
+                E: de::Error,
+            {
+                let column_type: UiColumnType =
+                    serde::Deserialize::deserialize(serde::de::value::StrDeserializer::new(value))?;
+                Ok(UiColumn::new(column_type))
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<UiColumn, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut column_type: Option<UiColumnType> = None;
+                let mut width: Option<u16> = None;
+                let mut expand: Option<bool> = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "type" => {
+                            column_type = Some(map.next_value()?);
+                        }
+                        "width" => {
+                            width = Some(map.next_value()?);
+                        }
+                        "expand" => {
+                            expand = Some(map.next_value()?);
+                        }
+                        _ => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+
+                let column_type = column_type.ok_or_else(|| de::Error::missing_field("type"))?;
+                let width = width.unwrap_or_else(|| column_type.default_width());
+                let expand = expand.unwrap_or(column_type == UiColumnType::Command);
+                Ok(UiColumn {
+                    column_type,
+                    width,
+                    expand,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(UiColumnVisitor)
+    }
+}
+
+/// UI-specific settings for the interactive search.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Ui {
+    /// Columns to display in interactive search, from left to right.
+    /// The indicator column (" > ") is always shown first implicitly.
+    /// The "command" column should be last as it expands to fill remaining space.
+    /// Can be simple strings or objects with type and width.
+    #[serde(default = "Ui::default_columns")]
+    pub columns: Vec<UiColumn>,
+}
+
+impl Ui {
+    fn default_columns() -> Vec<UiColumn> {
+        vec![
+            UiColumn::new(UiColumnType::Duration),
+            UiColumn::new(UiColumnType::Time),
+            UiColumn::new(UiColumnType::Command),
+        ]
+    }
+
+    /// Validate the UI configuration.
+    /// Returns an error if more than one column has expand = true.
+    pub fn validate(&self) -> Result<()> {
+        let expand_count = self.columns.iter().filter(|c| c.expand).count();
+        if expand_count > 1 {
+            bail!(
+                "Only one column can have expand = true, but {} columns are set to expand",
+                expand_count
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Default for Ui {
+    fn default() -> Self {
+        Self {
+            columns: Self::default_columns(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Settings {
+    pub data_dir: Option<String>,
     pub dialect: Dialect,
     pub timezone: Timezone,
     pub style: Style,
@@ -531,6 +713,9 @@ pub struct Settings {
     pub theme: Theme,
 
     #[serde(default)]
+    pub ui: Ui,
+
+    #[serde(default)]
     pub scripts: scripts::Settings,
 
     #[serde(default)]
@@ -549,8 +734,15 @@ impl Settings {
             .expect("Could not deserialize config")
     }
 
+    fn effective_data_dir() -> PathBuf {
+        DATA_DIR
+            .get()
+            .cloned()
+            .unwrap_or_else(atuin_common::utils::data_dir)
+    }
+
     fn save_to_data_dir(filename: &str, value: &str) -> Result<()> {
-        let data_dir = atuin_common::utils::data_dir();
+        let data_dir = Self::effective_data_dir();
         let data_dir = data_dir.as_path();
 
         let path = data_dir.join(filename);
@@ -561,7 +753,7 @@ impl Settings {
     }
 
     fn read_from_data_dir(filename: &str) -> Option<String> {
-        let data_dir = atuin_common::utils::data_dir();
+        let data_dir = Self::effective_data_dir();
         let data_dir = data_dir.as_path();
 
         let path = data_dir.join(filename);
@@ -758,7 +950,10 @@ impl Settings {
     }
 
     pub fn builder() -> Result<ConfigBuilder<DefaultState>> {
-        let data_dir = atuin_common::utils::data_dir();
+        Self::builder_with_data_dir(&atuin_common::utils::data_dir())
+    }
+
+    fn builder_with_data_dir(data_dir: &std::path::Path) -> Result<ConfigBuilder<DefaultState>> {
         let db_path = data_dir.join("history.db");
         let record_store_path = data_dir.join("records.db");
         let kv_path = data_dir.join("kv.db");
@@ -861,12 +1056,9 @@ impl Settings {
 
     pub fn new() -> Result<Self> {
         let config_dir = atuin_common::utils::config_dir();
-        let data_dir = atuin_common::utils::data_dir();
 
         create_dir_all(&config_dir)
             .wrap_err_with(|| format!("could not create dir {config_dir:?}"))?;
-
-        create_dir_all(&data_dir).wrap_err_with(|| format!("could not create dir {data_dir:?}"))?;
 
         let mut config_file = if let Ok(p) = std::env::var("ATUIN_CONFIG_DIR") {
             PathBuf::from(p)
@@ -878,13 +1070,55 @@ impl Settings {
 
         config_file.push("config.toml");
 
-        let mut config_builder = Self::builder()?;
+        // extract data_dir first so we can use it as the base for other path defaults
+        let effective_data_dir = if config_file.exists() {
+            #[derive(Deserialize, Default)]
+            struct DataDirOnly {
+                data_dir: Option<String>,
+            }
+
+            let config_file_str = config_file
+                .to_str()
+                .ok_or_else(|| eyre!("config file path is not valid UTF-8"))?;
+
+            let partial_config = Config::builder()
+                .add_source(ConfigFile::new(config_file_str, FileFormat::Toml))
+                .add_source(
+                    Environment::with_prefix("atuin")
+                        .prefix_separator("_")
+                        .separator("__"),
+                )
+                .build()
+                .ok();
+
+            let custom_data_dir = partial_config
+                .and_then(|c| c.try_deserialize::<DataDirOnly>().ok())
+                .and_then(|d| d.data_dir);
+
+            match custom_data_dir {
+                Some(dir) => {
+                    let expanded = shellexpand::full(&dir)
+                        .map_err(|e| eyre!("failed to expand data_dir path: {}", e))?;
+                    PathBuf::from(expanded.as_ref())
+                }
+                None => atuin_common::utils::data_dir(),
+            }
+        } else {
+            atuin_common::utils::data_dir()
+        };
+
+        DATA_DIR.set(effective_data_dir.clone()).ok();
+
+        create_dir_all(&effective_data_dir)
+            .wrap_err_with(|| format!("could not create dir {effective_data_dir:?}"))?;
+
+        let mut config_builder = Self::builder_with_data_dir(&effective_data_dir)?;
 
         config_builder = if config_file.exists() {
-            config_builder.add_source(ConfigFile::new(
-                config_file.to_str().unwrap(),
-                FileFormat::Toml,
-            ))
+            let config_file_str = config_file
+                .to_str()
+                .ok_or_else(|| eyre!("config file path is not valid UTF-8"))?;
+            config_builder.add_source(ConfigFile::new(config_file_str, FileFormat::Toml))
         } else {
             let mut file = File::create(config_file).wrap_err("could not create config file")?;
             file.write_all(EXAMPLE_CONFIG.as_bytes())
@@ -904,6 +1138,9 @@ impl Settings {
         settings.key_path = Self::expand_path(settings.key_path)?;
         settings.session_path = Self::expand_path(settings.session_path)?;
         settings.daemon.socket_path = Self::expand_path(settings.daemon.socket_path)?;
+
+        // Validate UI settings
+        settings.ui.validate()?;
 
         Ok(settings)
     }
@@ -1042,5 +1279,45 @@ mod tests {
         assert_eq!(settings.default_filter_mode(true), super::FilterMode::Host,);
 
         Ok(())
+    }
+
+    #[test]
+    fn builder_with_data_dir_uses_custom_paths() -> Result<()> {
+        use std::path::PathBuf;
+
+        let custom_dir = PathBuf::from("/custom/data/dir");
+        let builder = super::Settings::builder_with_data_dir(&custom_dir)?;
+        let config = builder.build()?;
+
+        let db_path: String = config.get("db_path")?;
+        let key_path: String = config.get("key_path")?;
+        let session_path: String = config.get("session_path")?;
+        let record_store_path: String = config.get("record_store_path")?;
+        let kv_db_path: String = config.get("kv.db_path")?;
+        let scripts_db_path: String = config.get("scripts.db_path")?;
+
+        assert_eq!(db_path, custom_dir.join("history.db").to_str().unwrap());
+        assert_eq!(key_path, custom_dir.join("key").to_str().unwrap());
+        assert_eq!(session_path, custom_dir.join("session").to_str().unwrap());
+        assert_eq!(
+            record_store_path,
+            custom_dir.join("records.db").to_str().unwrap()
+        );
+        assert_eq!(kv_db_path, custom_dir.join("kv.db").to_str().unwrap());
+        assert_eq!(
+            scripts_db_path,
+            custom_dir.join("scripts.db").to_str().unwrap()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn effective_data_dir_returns_default_when_not_set() {
+        let effective = super::Settings::effective_data_dir();
+        let default = atuin_common::utils::data_dir();
+
+        assert!(effective.to_str().is_some());
+        assert!(effective.ends_with("atuin") || effective == default);
     }
 }
