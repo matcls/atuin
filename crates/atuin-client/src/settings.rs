@@ -393,6 +393,18 @@ pub struct Search {
     pub filters: Vec<FilterMode>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Tmux {
+    /// Enable using atuin with tmux popup (tmux >= 3.2)
+    pub enabled: bool,
+
+    /// Width of the tmux popup (percentage)
+    pub width: String,
+
+    /// Height of the tmux popup (percentage)
+    pub height: String,
+}
+
 impl Default for Preview {
     fn default() -> Self {
         Self {
@@ -434,6 +446,16 @@ impl Default for Search {
                 FilterMode::Workspace,
                 FilterMode::Directory,
             ],
+        }
+    }
+}
+
+impl Default for Tmux {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            width: "80%".to_string(),
+            height: "60%".to_string(),
         }
     }
 }
@@ -487,7 +509,13 @@ impl UiColumnType {
             UiColumnType::Directory => 20,
             UiColumnType::Host => 15,
             UiColumnType::User => 10,
-            UiColumnType::Exit => 3,
+            UiColumnType::Exit => {
+                if cfg!(windows) {
+                    11 // 32-bit integer on Windows: "-1978335212"
+                } else {
+                    3 // Usually a byte on Unix
+                }
+            }
             UiColumnType::Command => 0, // Expands to fill
         }
     }
@@ -720,6 +748,9 @@ pub struct Settings {
 
     #[serde(default)]
     pub kv: kv::Settings,
+
+    #[serde(default)]
+    pub tmux: Tmux,
 }
 
 impl Settings {
@@ -1040,6 +1071,9 @@ impl Settings {
             )?
             .set_default("theme.name", "default")?
             .set_default("theme.debug", None::<bool>)?
+            .set_default("tmux.enabled", true)?
+            .set_default("tmux.width", "80%")?
+            .set_default("tmux.height", "60%")?
             .set_default(
                 "prefers_reduced_motion",
                 std::env::var("NO_MOTION")

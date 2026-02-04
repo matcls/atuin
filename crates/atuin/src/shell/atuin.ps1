@@ -30,8 +30,9 @@ if (!(Get-Module PSReadLine -ErrorAction Ignore)) {
 }
 
 New-Module -Name Atuin -ScriptBlock {
-    if (-not $env:ATUIN_SESSION) {
+    if (-not $env:ATUIN_SESSION -or $env:ATUIN_PID -ne $PID) {
         $env:ATUIN_SESSION = atuin uuid
+        $env:ATUIN_PID = $PID
     }
 
     $script:atuinHistoryId = $null
@@ -62,7 +63,8 @@ New-Module -Name Atuin -ScriptBlock {
         $lastRunStatus = $?
 
         # Exit statuses are maintained separately for native and PowerShell commands, this needs to be taken into account.
-        $exitCode = if ($lastRunStatus) { 0 } elseif ($global:LASTEXITCODE) { $global:LASTEXITCODE } else { 1 }
+        $lastNativeExitCode = $global:LASTEXITCODE
+        $exitCode = if ($lastRunStatus) { 0 } elseif ($lastNativeExitCode) { $lastNativeExitCode } else { 1 }
 
         ## 2. Report the status of the previous command to Atuin (atuin history end).
 
@@ -124,6 +126,7 @@ New-Module -Name Atuin -ScriptBlock {
             $env:ATUIN_COMMAND_LINE = $null
         }
 
+        $global:LASTEXITCODE = $lastNativeExitCode
         return $line
     }
 
